@@ -7,8 +7,6 @@ import { Model } from 'mongoose';
 import { BullWorkQueuesPort, GenericConsumerProcessor } from 'src/core/ports/bull-work-queues.port';
 import { StorageServicePort } from 'src/core/ports/storage-service.port';
 import { EnvService } from 'src/infrastructure/env/env.service';
-import { PixerLoggerService } from 'src/pixer-logger/pixer-logger.service';
-import { Log } from 'src/utils/log/log';
 
 import { DefaultQueueConfig } from './enums/default-queue.config';
 import { QueuePrefixes } from './enums/queue-prefixes.enum';
@@ -54,8 +52,7 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
   constructor(
     @InjectModel(BullWorkQueueConfig.name)
     private readonly bullWorkQueueConfigModel: Model<BullWorkQueueConfig>,
-    @Inject(PixerLoggerService)
-    private readonly loggerService: PixerLoggerService,
+    private readonly loggerService: LoggerService,
     private readonly redisProvider: StorageServicePort,
   ) {
     this.queues = [];
