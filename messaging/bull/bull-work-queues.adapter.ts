@@ -1,14 +1,22 @@
 import { Inject, Injectable } from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+
 import { Queue, Worker } from 'bullmq';
+import { Model } from 'mongoose';
+
+import { BullWorkQueuesPort, GenericConsumerProcessor } from 'src/core/ports/bull-work-queues.port';
+import { StorageServicePort } from 'src/core/ports/storage-service.port';
 import { EnvService } from 'src/infrastructure/env/env.service';
 import { PixerLoggerService } from 'src/pixer-logger/pixer-logger.service';
 import { Log } from 'src/utils/log/log';
-import { BullWorkQueueConfig } from './schemas/bull-work-queue-config';
-import { Model } from 'mongoose';
-import { InjectModel } from '@nestjs/mongoose';
-import { StorageServicePort } from 'src/core/ports/storage-service.port';
+
+import { DefaultQueueConfig } from './enums/default-queue.config';
 import { QueuePrefixes } from './enums/queue-prefixes.enum';
-import { BullWorkQueuesPort, GenericConsumerProcessor } from 'src/core/ports/bull-work-queues.port';
+import { ConsumerNotDefinedException } from './exceptions/consumer-not-defined.exception';
+import { QueueConfigurationNotFoundException } from './exceptions/queue-configuration-not-found.exception';
+import { QueueNotFoundException } from './exceptions/queue-not-fount.exception';
+import { UndefinedProcessorException } from './exceptions/undefined-processor.exception';
+import { BullWorkQueueConfig } from './schemas/bull-work-queue-config';
 
 @Injectable()
 export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
@@ -19,14 +27,20 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     port: parseInt(EnvService.getEnv('REDIS_PORT')),
   };
 
-  private readonly ENABLE_INSTANCE_CONSUMERS =
-    EnvService.getEnv('ENABLE_INSTANCE_CONSUMERS') === 'true';
+  private readonly ENABLE_QUEUE_CONSUMERS =
+    EnvService.getEnv('ENABLE_QUEUE_CONSUMERS') === 'true' ? true : false;
 
   private readonly CONFIG_CACHE_KEY = 'bullworkqueueconfigs';
 
-  private queues: Queue[]; // filas internas
+  private queues: Queue[]; // filas internas a partir do banco
+  private defaultQueues: Queue[]; // filas padrão
   // consumidores das filas
   private consumers: {
+    queueName: string;
+    processor: GenericConsumerProcessor;
+    worker: Worker; // consumidor da fila
+  }[];
+  private defaultConsumers: {
     queueName: string;
     processor: GenericConsumerProcessor;
     worker: Worker; // consumidor da fila
@@ -35,6 +49,7 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
   private consumerProcessors: { [key: string]: GenericConsumerProcessor };
   // configurações locais das filas
   private queuesConfig: BullWorkQueueConfig[];
+  private defaultQueuesConfig: BullWorkQueueConfig[];
 
   constructor(
     @InjectModel(BullWorkQueueConfig.name)
@@ -44,8 +59,14 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     private readonly redisProvider: StorageServicePort,
   ) {
     this.queues = [];
+    this.defaultQueues = [];
+
     this.consumers = [];
+    this.defaultConsumers = [];
+
     this.queuesConfig = [];
+    this.defaultQueuesConfig = [];
+
     this.consumerProcessors = {};
   }
 
@@ -57,6 +78,7 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
       }),
       this.constructor.name,
     );
+    this.initDefaultQueues();
 
     await this.loadQueuesConfig();
     this.initQueues();
@@ -66,7 +88,10 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
         scope: this.constructor.name,
         message: 'Bull queues service initialized',
         payload: {
-          activeQueues: this.queues.map((queue) => queue.name),
+          activeQueues: [
+            ...this.queues.map((queue) => queue.name),
+            ...this.defaultQueues.map((queue) => queue.name),
+          ],
         },
       }),
       this.constructor.name,
@@ -75,26 +100,66 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     setTimeout(() => {
       // aguarda o carregamento das configurações das filas e
       // o preenchimento do array de processadores para criar os consumidores
+      this.initDefaultConsumers();
       this.initConsumers();
-    }, 2000);
+    }, 5000);
   }
 
   private initQueues() {
     this.queues = [];
+
+    if (!this.ENABLE_QUEUE_CONSUMERS) {
+      this.loggerService.warnWithPayload(
+        new Log({
+          scope: this.constructor.name,
+          message: 'Dynamic queues were disabled by environment variable',
+        }),
+        this.constructor.name,
+      );
+      return;
+    }
 
     this.queuesConfig.forEach((config) => {
       this.createQueue(config.name);
     });
   }
 
+  private initDefaultQueues() {
+    this.defaultQueues = [];
+    this.defaultQueuesConfig = [];
+
+    if (!this.ENABLE_QUEUE_CONSUMERS) {
+      this.loggerService.warnWithPayload(
+        new Log({
+          scope: this.constructor.name,
+          message: 'Default queues were disabled by environment variable',
+        }),
+        this.constructor.name,
+      );
+      return;
+    }
+
+    Object.values(QueuePrefixes).forEach((prefix) => {
+      const name = `${prefix}-default-queue`;
+      this.createDefaultQueue(name);
+
+      this.defaultQueuesConfig.push({
+        name,
+        queueGroupIndentity: prefix,
+        workerLimiter: DefaultQueueConfig.workerLimiter,
+        jobOptions: DefaultQueueConfig.jobOptions,
+      });
+    });
+  }
+
   private initConsumers() {
     this.consumers = [];
 
-    if (!this.ENABLE_INSTANCE_CONSUMERS) {
-      this.loggerService.logWithPayload(
+    if (!this.ENABLE_QUEUE_CONSUMERS) {
+      this.loggerService.warnWithPayload(
         new Log({
           scope: this.constructor.name,
-          message: 'Queue consumers were disabled by environment variable',
+          message: 'Dynamic bull consumers were disabled by environment variable',
         }),
         this.constructor.name,
       );
@@ -103,6 +168,25 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
 
     for (const queueConfig of this.queuesConfig) {
       this.createConsumer(queueConfig.name);
+    }
+  }
+
+  private initDefaultConsumers() {
+    this.defaultConsumers = [];
+
+    if (!this.ENABLE_QUEUE_CONSUMERS) {
+      this.loggerService.warnWithPayload(
+        new Log({
+          scope: this.constructor.name,
+          message: 'Default bull consumers were disabled by environment variable',
+        }),
+        this.constructor.name,
+      );
+      return;
+    }
+
+    for (const queue of this.defaultQueues) {
+      this.createConsumer(queue.name, true);
     }
   }
 
@@ -140,7 +224,7 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     );
   }
 
-  async refreshQueuesConfig(fromDatabase?: boolean) {
+  async refreshQueuesConfig(fromCache?: boolean) {
     this.loggerService.logWithPayload(
       new Log({
         scope: this.constructor.name,
@@ -149,7 +233,7 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
       this.constructor.name,
     );
 
-    if (fromDatabase) {
+    if (!fromCache) {
       await this.loadQueuesConfig();
       this.initQueues();
 
@@ -225,8 +309,10 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     );
   }
 
-  private getQueue(queueName: string) {
-    const queue = this.queues.find((queue) => queue.name === queueName);
+  private getQueue(queueName: string, isDefaultQueue?: boolean) {
+    const queue = isDefaultQueue
+      ? this.defaultQueues.find((queue) => queue.name === queueName)
+      : this.queues.find((queue) => queue.name === queueName);
 
     if (!queue) {
       this.loggerService.errorWithPayload(
@@ -239,13 +325,24 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
         }),
         this.constructor.name,
       );
-      throw new Error('Queue instance not found for name: ' + queueName);
+      throw new QueueNotFoundException(queueName);
     }
     return queue;
   }
 
-  private getQueueConfig(queueName: string) {
-    const queueConfig = this.queuesConfig.find((queueConfig) => queueConfig.name === queueName);
+  private async closeQueue(queueName: string) {
+    const queue = this.getQueue(queueName);
+
+    await queue.close();
+
+    this.queues = this.queues.filter((queue) => queue.name !== queueName);
+    this.queuesConfig = this.queuesConfig.filter((config) => config.name !== queueName);
+  }
+
+  private getQueueConfig(queueName: string, isDefaultQueue?: boolean) {
+    const queueConfig = isDefaultQueue
+      ? this.defaultQueuesConfig.find((config) => config.name === queueName)
+      : this.queuesConfig.find((config) => config.name === queueName);
 
     if (!queueConfig) {
       this.loggerService.errorWithPayload(
@@ -258,9 +355,46 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
         }),
         this.constructor.name,
       );
-      throw new Error('Queue configuration not found for queue: ' + queueName);
+      throw new QueueConfigurationNotFoundException(queueName);
     }
     return queueConfig;
+  }
+
+  private getQueueConfigByPrefix(queuePrefix: QueuePrefixes, isDefaultQueue?: boolean) {
+    const queueConfig = isDefaultQueue
+      ? this.defaultQueuesConfig.find((config) => config.queueGroupIndentity === queuePrefix)
+      : this.queuesConfig.find((config) => config.queueGroupIndentity === queuePrefix);
+
+    if (!queueConfig) {
+      this.loggerService.errorWithPayload(
+        new Log({
+          scope: this.constructor.name,
+          message: 'Queue configuration not found',
+          payload: {
+            queuePrefix,
+          },
+        }),
+        this.constructor.name,
+      );
+      throw new QueueConfigurationNotFoundException(queuePrefix);
+    }
+    return queueConfig;
+  }
+
+  private checkProcessorRegistered(queuePrefix: QueuePrefixes) {
+    if (!this.consumerProcessors[queuePrefix]) {
+      this.loggerService.errorWithPayload(
+        new Log({
+          scope: this.constructor.name,
+          message: 'Consumer processor not found',
+          payload: {
+            queuePrefix,
+          },
+        }),
+        this.constructor.name,
+      );
+      throw new UndefinedProcessorException(queuePrefix);
+    }
   }
 
   private createQueue(queueName: string): void {
@@ -274,7 +408,6 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
         message: 'Queue created',
         payload: {
           queueName,
-          queueConfig: this.getQueueConfig(queueName),
         },
       }),
       this.constructor.name,
@@ -283,7 +416,29 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     this.queues.push(queue);
   }
 
+  private createDefaultQueue(queueName: string): void {
+    const queue = new Queue(queueName, {
+      connection: this.redisConfig,
+    });
+
+    this.loggerService.logWithPayload(
+      new Log({
+        scope: this.constructor.name,
+        message: 'Default queue created',
+        payload: {
+          queueName,
+        },
+      }),
+      this.constructor.name,
+    );
+
+    this.defaultQueues.push(queue);
+  }
+
   async addQueueConfig(queueConfig: BullWorkQueueConfig): Promise<void> {
+    // check first if the processor is already registered
+    this.checkProcessorRegistered(queueConfig.queueGroupIndentity);
+
     if (this.queuesConfig.find((config) => config.name === queueConfig.name)) {
       this.loggerService.errorWithPayload(
         new Log({
@@ -380,12 +535,12 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
   // na edição das configurações da fila, o consumidor é apagado e criado novamente
   // é necessario que o metodo processador esteja registrado no objeto consumerProcessors
   // e que a fila esteja registrada no objeto queuesConfig
-  createConsumer(queueName: string): void {
-    if (!this.ENABLE_INSTANCE_CONSUMERS) {
-      this.loggerService.logWithPayload(
+  createConsumer(queueName: string, isDefaultQueue?: boolean): void {
+    if (!this.ENABLE_QUEUE_CONSUMERS) {
+      this.loggerService.warnWithPayload(
         new Log({
           scope: this.constructor.name,
-          message: 'Queue consumers were disabled by environment variable',
+          message: 'Bull queue consumers were disabled by environment variable',
         }),
         this.constructor.name,
       );
@@ -393,23 +548,11 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     }
 
     try {
-      const queueConfig = this.getQueueConfig(queueName);
-      const processor = this.consumerProcessors[queueConfig.queueGroupIndentity];
+      // check first if the processor is already registered
+      const queueConfig = this.getQueueConfig(queueName, isDefaultQueue);
 
-      if (!processor) {
-        this.loggerService.errorWithPayload(
-          new Log({
-            scope: this.constructor.name,
-            message: 'Consumer processor not found',
-            payload: {
-              queueName,
-              queueConfig,
-            },
-          }),
-          this.constructor.name,
-        );
-        throw new Error('Consumer processor not found for queue: ' + queueName);
-      }
+      this.checkProcessorRegistered(queueConfig.queueGroupIndentity);
+      const processor = this.consumerProcessors[queueConfig.queueGroupIndentity];
 
       const worker = new Worker(queueName, processor, {
         connection: this.redisConfig,
@@ -420,6 +563,12 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
         concurrency: queueConfig.workerLimiter.concurrency,
         stalledInterval: queueConfig.workerLimiter.stalledInterval,
         maxStalledCount: queueConfig.workerLimiter.maxStalledCount,
+        removeOnComplete: {
+          count: queueConfig.workerLimiter.completedJobsToKeep,
+        },
+        removeOnFail: {
+          count: queueConfig.workerLimiter.failedJobsToKeep,
+        },
       });
 
       const consumer = {
@@ -428,7 +577,7 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
         worker,
       };
 
-      this.consumers.push(consumer);
+      isDefaultQueue ? this.defaultConsumers.push(consumer) : this.consumers.push(consumer);
 
       this.loggerService.logWithPayload(
         new Log({
@@ -436,7 +585,6 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
           message: 'Consumer created',
           payload: {
             queueName,
-            queueConfig,
           },
         }),
         this.constructor.name,
@@ -453,12 +601,11 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
         }),
         this.constructor.name,
       );
-      throw error;
     }
   }
 
   // o metodo deve ser pubçico para caso seja necessário apagar o consumidor em tempo de execução sem precisar apagar a fila
-  async deleteConsumer(queueName: string): Promise<void> {
+  async deleteConsumer(queueName: string, shouldCloseQueue?: boolean): Promise<void> {
     const consumerIndex = this.consumers.findIndex((consumer) => consumer.queueName === queueName);
 
     if (consumerIndex === -1) {
@@ -472,13 +619,18 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
         }),
         this.constructor.name,
       );
-      throw new Error('Consumer not found for queue: ' + queueName);
+      throw new ConsumerNotDefinedException(queueName);
     }
 
     // aguarda a finalização dos jobs em execução e fecha o consumidor
     await this.consumers[consumerIndex].worker.close();
     // apaga o consumidor da lista
     this.consumers = this.consumers.filter((consumer) => consumer.queueName !== queueName);
+
+    if (shouldCloseQueue) {
+      // fecha a fila
+      await this.closeQueue(queueName);
+    }
 
     this.loggerService.logWithPayload(
       new Log({
@@ -511,7 +663,9 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
   }
 
   private async deleteAllConsumers() {
-    await Promise.all(this.consumers.map((consumer) => this.deleteConsumer(consumer.queueName)));
+    await Promise.all(
+      this.consumers.map((consumer) => this.deleteConsumer(consumer.queueName, true)),
+    );
 
     this.loggerService.logWithPayload(
       new Log({
@@ -522,44 +676,53 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     );
   }
 
-  async addJob(queueName: string, job: unknown, delay?: number): Promise<void> {
+  async addJob(
+    queueName: string,
+    job: unknown,
+    jobOptions?: { delay?: number; queueIdentity: QueuePrefixes },
+  ): Promise<void> {
+    let queue: Queue;
+    let queueConfig: BullWorkQueueConfig;
+
     try {
-      const queue = this.getQueue(queueName);
-      const queueConfig = this.getQueueConfig(queueName);
-
-      await queue.add(queueName, job, {
-        attempts: queueConfig.jobOptions.attempts,
-        backoff: queueConfig.jobOptions.backoff,
-        delay: delay || queueConfig.jobOptions.delay,
-        removeOnComplete: queueConfig.jobOptions.removeOnComplete,
-        removeOnFail: queueConfig.jobOptions.removeOnFail,
-      });
-
-      this.loggerService.logWithPayload(
-        new Log({
-          scope: this.constructor.name,
-          message: 'Job added to queue',
-          payload: {
-            queueName,
-            job,
-          },
-        }),
-        this.constructor.name,
-      );
+      queue = this.getQueue(queueName);
+      queueConfig = this.getQueueConfig(queueName);
     } catch (error) {
-      this.loggerService.errorWithPayload(
+      this.loggerService.warnWithPayload(
         new Log({
           scope: this.constructor.name,
-          message: 'Error adding job to queue',
+          message: 'Error on finding the queue. Trying add to default queue',
           payload: {
             queueName,
-            job,
-            error,
+            queueIdentity: jobOptions.queueIdentity,
+            error: error.message,
           },
         }),
         this.constructor.name,
       );
-      throw error;
+
+      queueConfig = this.getQueueConfigByPrefix(jobOptions.queueIdentity, true);
+      queue = this.getQueue(queueConfig.name, true);
     }
+
+    await queue.add(queue.name, job, {
+      attempts: queueConfig.jobOptions.attempts,
+      backoff: queueConfig.jobOptions.backoff,
+      delay: jobOptions?.delay || queueConfig.jobOptions.delay,
+      removeOnComplete: queueConfig.jobOptions.removeOnComplete,
+      removeOnFail: queueConfig.jobOptions.removeOnFail,
+    });
+
+    this.loggerService.logWithPayload(
+      new Log({
+        scope: this.constructor.name,
+        message: `Job added to queue ${queue.name}`,
+        payload: {
+          queueName: queue.name,
+          job,
+        },
+      }),
+      this.constructor.name,
+    );
   }
 }
