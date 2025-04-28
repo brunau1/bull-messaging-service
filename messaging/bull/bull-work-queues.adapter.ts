@@ -21,12 +21,15 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
   // as filas e os consumidores compartilham a mesma conexão com o redis
   // obs: se a fila não existir, o bull cria automaticamente
   private redisConfig = {
-    host: EnvService.getEnv('REDIS_HOST'),
-    port: parseInt(EnvService.getEnv('REDIS_PORT')),
+    host: EnvService.getEnv('REDIS_HOST').getValue(),
+    port: parseInt(EnvService.getEnv('REDIS_PORT').getValue()),
   };
 
   private readonly ENABLE_QUEUE_CONSUMERS =
-    EnvService.getEnv('ENABLE_QUEUE_CONSUMERS') === 'true' ? true : false;
+    EnvService.getEnv('ENABLE_QUEUE_CONSUMERS').getValue() === 'true' ? true : false;
+  // deve ser habilitado caso as filas da instancia atual devam emitir eventos de controle
+  private readonly ENABLE_QUEUE_EVENTS =
+    EnvService.getEnv('ENABLE_QUEUE_EVENTS').getValue() === 'true' ? true : false;
 
   private readonly CONFIG_CACHE_KEY = 'bullworkqueueconfigs';
 
@@ -44,7 +47,16 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     worker: Worker; // consumidor da fila
   }[];
   // processadores dos consumidores
-  private consumerProcessors: { [key: string]: GenericConsumerProcessor };
+  private consumerProcessors: { [key: QueuePrefixes | string]: GenericConsumerProcessor };
+  // controlador de eventos das filas
+  private queueGroupEvents: {
+    [key: QueuePrefixes | string]: {
+      queues: { [key: string]: QueueEvents };
+      defaultQueues: { [key: string]: QueueEvents };
+      successCallback: GenericQueueEventHandler;
+      failureCallback: GenericQueueEventHandler;
+    };
+  };
   // configurações locais das filas
   private queuesConfig: BullWorkQueueConfig[];
   private defaultQueuesConfig: BullWorkQueueConfig[];
@@ -54,6 +66,7 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     private readonly bullWorkQueueConfigModel: Model<BullWorkQueueConfig>,
     private readonly loggerService: LoggerService,
     private readonly redisProvider: StorageServicePort,
+    private readonly configurationProvider: ConfigurationPort,
   ) {
     this.queues = [];
     this.defaultQueues = [];
@@ -65,6 +78,7 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     this.defaultQueuesConfig = [];
 
     this.consumerProcessors = {};
+    this.queueGroupEvents = {};
   }
 
   async onModuleInit() {
@@ -109,15 +123,18 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
       this.loggerService.warnWithPayload(
         new Log({
           scope: this.constructor.name,
-          message: 'Dynamic queues were disabled by environment variable',
+          message:
+            'Dynamic queues were initialized but consumers were disabled by environment variable',
         }),
         this.constructor.name,
       );
-      return;
     }
 
     this.queuesConfig.forEach((config) => {
       this.createQueue(config.name);
+      // para casos onde não precisamos habilitar os eventos da fila
+      // obs: os eventos devem ser habilitados por padrão para as rotinas da aplicação
+      if (this.ENABLE_QUEUE_EVENTS) this.startQueueEventListeners(config.name, false);
     });
   }
 
@@ -129,25 +146,35 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
       this.loggerService.warnWithPayload(
         new Log({
           scope: this.constructor.name,
-          message: 'Default queues were disabled by environment variable',
+          message:
+            'Default queues are initialized but consumers were disabled by environment variable',
         }),
         this.constructor.name,
       );
-      return;
     }
 
     Object.values(QueuePrefixes).forEach((prefix) => {
-      const name = `${prefix}-default-queue`;
+      const name = this.generateDefaultQueueName(prefix);
       this.createDefaultQueue(name);
 
       this.defaultQueuesConfig.push({
         name,
-        queueGroupIndentity: prefix,
+        queueGroupIdentity: prefix,
         workerLimiter: DefaultQueueConfig.workerLimiter,
         jobOptions: DefaultQueueConfig.jobOptions,
       });
+
+      if (this.ENABLE_QUEUE_EVENTS) this.startQueueEventListeners(name, true);
     });
   }
+
+  private generateDefaultQueueName = (prefix: string) => `${prefix}-default-queue`;
+  // generate a unique job id containning the queue prefix and a random string of 10 characters
+  // must not contain special characters
+  private generateJobId = (prefix: string) =>
+    `${prefix}${Math.random().toString(36).slice(2, 12)}`.replace(/[^a-zA-Z0-9]/g, '');
+
+  private normalizeJobId = (jobId: string) => (jobId ? jobId.replace(/[^a-zA-Z0-9]/g, '') : null);
 
   private initConsumers() {
     this.consumers = [];
@@ -164,7 +191,21 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     }
 
     for (const queueConfig of this.queuesConfig) {
-      this.createConsumer(queueConfig.name);
+      const queuesConsumersToIgnore = this.configurationProvider.getValue<string>(
+        ConfigurationKey.queueCosumersToIgnore,
+      );
+      const listOfQueuesConsumersToIgnore = !!queuesConsumersToIgnore
+        ? queuesConsumersToIgnore?.split(',')
+        : [];
+
+      if (
+        !!listOfQueuesConsumersToIgnore.length &&
+        listOfQueuesConsumersToIgnore.includes(queueConfig.name)
+      ) {
+        continue;
+      }
+
+      this.createConsumer(queueConfig.name, false);
     }
   }
 
@@ -183,12 +224,28 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     }
 
     for (const queue of this.defaultQueues) {
+      const queuesConsumersToIgnore = this.configurationProvider.getValue<string>(
+        ConfigurationKey.queueCosumersToIgnore,
+      );
+      const listOfQueuesConsumersToIgnore = !!queuesConsumersToIgnore
+        ? queuesConsumersToIgnore
+            ?.split(',')
+            .map((queueName: string) => this.generateDefaultQueueName(queueName))
+        : [];
+
+      if (
+        !!listOfQueuesConsumersToIgnore.length &&
+        listOfQueuesConsumersToIgnore.includes(queue.name)
+      ) {
+        continue;
+      }
+
       this.createConsumer(queue.name, true);
     }
   }
 
   private async loadQueuesConfig() {
-    this.queuesConfig = this.queuesConfig || [];
+    this.queuesConfig = [];
 
     // Carrega as configurações padrão das filas a partir do banco de dados
     // popula o array de configurações das filas e o cache de configurações
@@ -231,20 +288,20 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     );
 
     if (!fromCache) {
+      // apaga os consumidores atuais e cria novos
+      await this.deleteAllConsumers();
+
       await this.loadQueuesConfig();
       this.initQueues();
 
+      this.initConsumers();
+    } else {
       // apaga os consumidores atuais e cria novos
       await this.deleteAllConsumers();
 
-      this.initConsumers();
-    } else {
       // verificar necessidade de usar o cache
       await this.loadQueueConfigsFromCache();
       this.initQueues();
-
-      // apaga os consumidores atuais e cria novos
-      await this.deleteAllConsumers();
 
       this.initConsumers();
     }
@@ -262,7 +319,9 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
   }
 
   private async loadQueueConfigsFromCache() {
-    const cacheConfigsJson = await this.redisProvider.getValueByKey(this.CONFIG_CACHE_KEY);
+    const cacheConfigsJson = await this.redisProvider.getValueByKeyWithPrefix(
+      this.CONFIG_CACHE_KEY,
+    );
     const cacheConfigs: BullWorkQueueConfig[] = JSON.parse(cacheConfigsJson.toString());
 
     if (!cacheConfigs || cacheConfigs.length === 0) {
@@ -306,34 +365,177 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     );
   }
 
+  // Adiciona um manipulador de eventos para a fila
+  // Deve ser chamado na inicialização da aplicação da mesma forma que o método addConsumerProcessor
+  // obs: o manipulador de eventos é chamado quando um job está completado ou com falha
+  addQueueEventHandler(
+    queuePrefix: QueuePrefixes,
+    successCallback?: GenericQueueEventHandler,
+    failureCallback?: GenericQueueEventHandler,
+  ) {
+    this.queueGroupEvents[queuePrefix] = {
+      queues: null,
+      defaultQueues: null,
+      successCallback: successCallback || null,
+      failureCallback: failureCallback || null,
+    };
+
+    this.loggerService.logWithPayload(
+      new Log({
+        scope: this.constructor.name,
+        message: 'Queue event handler added',
+        payload: {
+          queuePrefix,
+        },
+      }),
+      this.constructor.name,
+    );
+  }
+
+  // Inicia os listeners de eventos da fila
+  private startQueueEventListeners(queueName: string, isDefaultQueue?: boolean) {
+    try {
+      const queueConfig = this.getQueueConfig(queueName, isDefaultQueue);
+
+      const hasConfig = !!this.queueGroupEvents[queueConfig.queueGroupIdentity];
+
+      if (hasConfig) {
+        const queueEvents = new QueueEvents(queueName, {
+          connection: this.redisConfig,
+          autorun: true,
+        });
+
+        const { successCallback, failureCallback } =
+          this.queueGroupEvents[queueConfig.queueGroupIdentity];
+
+        if (!!successCallback) {
+          queueEvents.on(
+            'completed',
+            (async (data) => {
+              try {
+                await successCallback(data);
+              } catch (error) {
+                this.loggerService.errorWithPayload(
+                  new Log({
+                    scope: this.constructor.name,
+                    message: 'Error executing queue success callback',
+                    payload: {
+                      queueName,
+                      error,
+                    },
+                  }),
+                  this.constructor.name,
+                );
+              }
+            }).bind(this),
+          );
+        }
+
+        if (!!failureCallback) {
+          queueEvents.on(
+            'failed',
+            (async (data) => {
+              try {
+                await failureCallback(data);
+              } catch (error) {
+                this.loggerService.errorWithPayload(
+                  new Log({
+                    scope: this.constructor.name,
+                    message: 'Error executing queue failure callback',
+                    payload: {
+                      queueName,
+                      error,
+                    },
+                  }),
+                  this.constructor.name,
+                );
+              }
+            }).bind(this),
+          );
+        }
+
+        const hasAtLeastOneCallback = !!successCallback || !!failureCallback;
+        // salva a instância do listener para poder ser acessada posteriormente
+        isDefaultQueue && hasAtLeastOneCallback
+          ? (this.queueGroupEvents[queueConfig.queueGroupIdentity].defaultQueues[queueName] =
+              queueEvents)
+          : hasAtLeastOneCallback
+          ? (this.queueGroupEvents[queueConfig.queueGroupIdentity].queues[queueName] = queueEvents)
+          : null;
+      } else {
+        this.loggerService.logWithPayload(
+          new Log({
+            scope: this.constructor.name,
+            message: 'Queue event listeners not set',
+            payload: {
+              queueName,
+            },
+          }),
+          this.constructor.name,
+        );
+      }
+    } catch (error) {
+      this.loggerService.errorWithPayload(
+        new Log({
+          scope: this.constructor.name,
+          message: 'Error starting queue event listeners',
+          payload: {
+            queueName,
+            error,
+          },
+        }),
+        this.constructor.name,
+      );
+    }
+  }
+
   private getQueue(queueName: string, isDefaultQueue?: boolean) {
     const queue = isDefaultQueue
       ? this.defaultQueues.find((queue) => queue.name === queueName)
       : this.queues.find((queue) => queue.name === queueName);
 
     if (!queue) {
-      this.loggerService.errorWithPayload(
-        new Log({
-          scope: this.constructor.name,
-          message: 'Queue instance not found on application',
-          payload: {
-            queueName,
-          },
-        }),
-        this.constructor.name,
-      );
       throw new QueueNotFoundException(queueName);
     }
     return queue;
   }
 
+  private hasActiveEvents(queueName: string, isDefaultQueue?: boolean) {
+    const queueConfig = this.getQueueConfig(queueName, isDefaultQueue);
+    const queueEvents = this.queueGroupEvents[queueConfig.queueGroupIdentity];
+
+    if (!queueEvents) {
+      return false;
+    }
+
+    if (isDefaultQueue) {
+      return !!queueEvents.defaultQueues[queueName];
+    }
+
+    return !!queueEvents.queues[queueName];
+  }
+
   private async closeQueue(queueName: string) {
     const queue = this.getQueue(queueName);
+    const hasActiveEvents = this.hasActiveEvents(queueName);
 
+    // fecha os listeners de eventos da fila caso existam
+    if (hasActiveEvents) {
+      const queueConfig = this.getQueueConfig(queueName);
+      const queueEvents = this.queueGroupEvents[queueConfig.queueGroupIdentity];
+
+      await queueEvents.queues[queueName].close();
+      delete queueEvents.queues[queueName];
+    }
+
+    // aguarda a finalização dos jobs em execução
+    await queue.drain();
     await queue.close();
 
     this.queues = this.queues.filter((queue) => queue.name !== queueName);
     this.queuesConfig = this.queuesConfig.filter((config) => config.name !== queueName);
+
+    await this.redisProvider.setValue(this.CONFIG_CACHE_KEY, JSON.stringify(this.queuesConfig));
   }
 
   private getQueueConfig(queueName: string, isDefaultQueue?: boolean) {
@@ -342,39 +544,21 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
       : this.queuesConfig.find((config) => config.name === queueName);
 
     if (!queueConfig) {
-      this.loggerService.errorWithPayload(
-        new Log({
-          scope: this.constructor.name,
-          message: 'Queue configuration not found',
-          payload: {
-            queueName,
-          },
-        }),
-        this.constructor.name,
-      );
       throw new QueueConfigurationNotFoundException(queueName);
     }
+
     return queueConfig;
   }
 
   private getQueueConfigByPrefix(queuePrefix: QueuePrefixes, isDefaultQueue?: boolean) {
     const queueConfig = isDefaultQueue
-      ? this.defaultQueuesConfig.find((config) => config.queueGroupIndentity === queuePrefix)
-      : this.queuesConfig.find((config) => config.queueGroupIndentity === queuePrefix);
+      ? this.defaultQueuesConfig.find((config) => config.queueGroupIdentity === queuePrefix)
+      : this.queuesConfig.find((config) => config.queueGroupIdentity === queuePrefix);
 
     if (!queueConfig) {
-      this.loggerService.errorWithPayload(
-        new Log({
-          scope: this.constructor.name,
-          message: 'Queue configuration not found',
-          payload: {
-            queuePrefix,
-          },
-        }),
-        this.constructor.name,
-      );
       throw new QueueConfigurationNotFoundException(queuePrefix);
     }
+
     return queueConfig;
   }
 
@@ -434,7 +618,7 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
 
   async addQueueConfig(queueConfig: BullWorkQueueConfig): Promise<void> {
     // check first if the processor is already registered
-    this.checkProcessorRegistered(queueConfig.queueGroupIndentity);
+    this.checkProcessorRegistered(queueConfig.queueGroupIdentity as QueuePrefixes);
 
     if (this.queuesConfig.find((config) => config.name === queueConfig.name)) {
       this.loggerService.errorWithPayload(
@@ -474,6 +658,8 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
 
     // cria o consumidor da fila
     this.createConsumer(queueConfig.name);
+
+    if (this.ENABLE_QUEUE_EVENTS) this.startQueueEventListeners(queueConfig.name, false);
   }
 
   async editQueueConfig(queueConfig: BullWorkQueueConfig): Promise<void> {
@@ -507,11 +693,9 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     await this.bullWorkQueueConfigModel.deleteOne({
       name: queueName,
     });
-
-    this.queues = this.queues.filter((queue) => queue.name !== queueName);
-    this.queuesConfig = this.queuesConfig.filter((config) => config.name !== queueName);
-
-    await this.redisProvider.setValue(this.CONFIG_CACHE_KEY, JSON.stringify(this.queuesConfig));
+    // Apaga o consumidor da fila
+    await this.deleteConsumer(queueName);
+    await this.closeQueue(queueName);
 
     this.loggerService.logWithPayload(
       new Log({
@@ -523,9 +707,6 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
       }),
       this.constructor.name,
     );
-
-    // Apaga o consumidor da fila
-    await this.deleteConsumer(queueName);
   }
 
   // chamado na inicialização da aplicação ou na criação de um novo consumidor em tempo de execução
@@ -548,8 +729,8 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
       // check first if the processor is already registered
       const queueConfig = this.getQueueConfig(queueName, isDefaultQueue);
 
-      this.checkProcessorRegistered(queueConfig.queueGroupIndentity);
-      const processor = this.consumerProcessors[queueConfig.queueGroupIndentity];
+      this.checkProcessorRegistered(queueConfig.queueGroupIdentity as QueuePrefixes);
+      const processor = this.consumerProcessors[queueConfig.queueGroupIdentity];
 
       const worker = new Worker(queueName, processor, {
         connection: this.redisConfig,
@@ -673,53 +854,69 @@ export class BullWorkQueuesAdapter implements BullWorkQueuesPort {
     );
   }
 
-  async addJob(
-    queueName: string,
-    job: unknown,
-    jobOptions?: { delay?: number; queueIdentity: QueuePrefixes },
-  ): Promise<void> {
+  private wasCreatedQueueInstanceAndConfig(queueName: string): boolean {
+    try {
+      this.getQueueConfig(queueName, false);
+      this.getQueue(queueName, false);
+
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  async addJob(jobData: unknown, jobOptions: JobOptionsDto): Promise<string> {
     let queue: Queue;
     let queueConfig: BullWorkQueueConfig;
 
     try {
-      queue = this.getQueue(queueName);
-      queueConfig = this.getQueueConfig(queueName);
-    } catch (error) {
-      this.loggerService.warnWithPayload(
+      const queueName = jobOptions.queueName;
+      const queueExists = !!queueName ? this.wasCreatedQueueInstanceAndConfig(queueName) : false;
+
+      if (!queueExists) {
+        queueConfig = this.getQueueConfigByPrefix(jobOptions.queueIdentity, true);
+        queue = this.getQueue(queueConfig.name, true);
+      } else {
+        queue = this.getQueue(jobOptions.queueName, false);
+        queueConfig = this.getQueueConfig(jobOptions.queueName, false);
+      }
+      const jobId =
+        this.normalizeJobId(jobOptions.jobId) || this.generateJobId(queueConfig.queueGroupIdentity);
+
+      await queue.add(queue.name, jobData, {
+        jobId,
+        attempts: queueConfig.jobOptions.attempts,
+        backoff: queueConfig.jobOptions.backoff,
+        delay: jobOptions.delay || queueConfig.jobOptions.delay,
+        removeOnComplete: queueConfig.jobOptions.removeOnComplete,
+        removeOnFail: queueConfig.jobOptions.removeOnFail,
+      });
+
+      this.loggerService.logWithPayload(
         new Log({
           scope: this.constructor.name,
-          message: 'Error on finding the queue. Trying add to default queue',
+          message: `Job added to queue ${queue.name}`,
           payload: {
-            queueName,
-            queueIdentity: jobOptions.queueIdentity,
-            error: error.message,
+            jobOptions,
           },
         }),
         this.constructor.name,
       );
 
-      queueConfig = this.getQueueConfigByPrefix(jobOptions.queueIdentity, true);
-      queue = this.getQueue(queueConfig.name, true);
+      return jobId;
+    } catch (error) {
+      this.loggerService.errorWithPayload(
+        new Log({
+          scope: this.constructor.name,
+          message: 'Error adding job to queue',
+          payload: {
+            jobOptions,
+            message: error.message,
+            stack: error.stack,
+          },
+        }),
+        this.constructor.name,
+      );
     }
-
-    await queue.add(queue.name, job, {
-      attempts: queueConfig.jobOptions.attempts,
-      backoff: queueConfig.jobOptions.backoff,
-      delay: jobOptions?.delay || queueConfig.jobOptions.delay,
-      removeOnComplete: queueConfig.jobOptions.removeOnComplete,
-      removeOnFail: queueConfig.jobOptions.removeOnFail,
-    });
-
-    this.loggerService.logWithPayload(
-      new Log({
-        scope: this.constructor.name,
-        message: `Job added to queue ${queue.name}`,
-        payload: {
-          queueName: queue.name,
-          job,
-        },
-      }),
-      this.constructor.name,
-    );
   }
 }
